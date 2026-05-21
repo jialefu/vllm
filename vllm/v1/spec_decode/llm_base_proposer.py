@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from importlib.util import find_spec
 from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
+from flashspec._internal.vllm_profile import record_stage
+from flashspec._internal.speculative.runtime import lazy_import_flashinfer
 
 from vllm.config import (
     CUDAGraphMode,
@@ -52,6 +55,36 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _round_philox_increment(increment: int) -> int:
+    return ((int(increment) + 3) // 4) * 4
+
+
+def _reserve_flashspec_seed_offsets(
+    increments: list[int],
+    *,
+    device: torch.device,
+) -> list[tuple[int, int]]:
+    """Reserve multiple FlashInfer-compatible Philox ranges with one state update."""
+
+    generator = lazy_import_flashinfer().utils.get_default_generators(device)
+    state = generator.get_state()
+    state_i64 = state.view(torch.int64)
+    seed = int(state_i64[0].item())
+    offset = int(state_i64[1].item())
+    reserved: list[tuple[int, int]] = []
+    for increment in increments:
+        offset += _round_philox_increment(increment)
+        reserved.append((seed, offset))
+    generator.set_state(
+        torch.tensor(
+            [seed, offset],
+            dtype=torch.int64,
+            device=torch.device("cpu"),
+        ).view(torch.uint8)
+    )
+    return reserved
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -66,6 +99,22 @@ class SpecDecodeBaseProposer:
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
+        self.last_draft_probs: torch.Tensor | None = None
+        self.last_draft_hidden_states: torch.Tensor | None = None
+        self.last_draft_selected_logits: torch.Tensor | None = None
+        self.last_draft_row_lse: torch.Tensor | None = None
+        self._flashspec_draft_workspace = None
+        self._flashspec_draft_workspace_key = None
+        self._flashspec_proposal_buffer_key = None
+        self._flashspec_proposal_token_ids = None
+        self._flashspec_proposal_selected_logits = None
+        self._flashspec_proposal_row_lse = None
+        self._flashspec_lm_head_weight_cache_key = None
+        self._flashspec_lm_head_weight_cache = None
+        self._flashspec_draft_rng_device = None
+        self._flashspec_draft_rng_generator = None
+        self._flashspec_draft_rng_state_i64 = None
+        self._flashspec_draft_logged = False
 
         self.device = device
         self.dtype = vllm_config.model_config.dtype
@@ -389,6 +438,427 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    def _use_draft_model_sampling(self, sampling_metadata: SamplingMetadata) -> bool:
+        return (
+            self.method == "draft_model"
+            and not self.parallel_drafting
+            and not sampling_metadata.all_greedy
+            and os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_SAMPLE", "0") == "1"
+        )
+
+    def _use_flashspec_draft_model_sampling(
+        self, sampling_metadata: SamplingMetadata
+    ) -> bool:
+        return (
+            self._use_draft_model_sampling(sampling_metadata)
+            and os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_FLASHSPEC", "0") == "1"
+        )
+
+    def _draft_model_sampling_impl(self) -> str:
+        impl = os.environ.get(
+            "FLASHSPEC_VLLM_DRAFT_MODEL_SAMPLE_IMPL",
+            "",
+        ).strip()
+        if impl not in {"", "stock", "flashspec_with_probs"}:
+            raise RuntimeError(
+                "FLASHSPEC_VLLM_DRAFT_MODEL_SAMPLE_IMPL must be unset, "
+                "'stock', or 'flashspec_with_probs'."
+            )
+        return impl
+
+    def _flashspec_lm_head_weight(self) -> torch.Tensor | None:
+        logits_processor = getattr(self.model, "logits_processor", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        lm_head_weight = getattr(lm_head, "weight", None)
+        if logits_processor is None or lm_head_weight is None:
+            return None
+        org_vocab_size = int(
+            getattr(logits_processor, "org_vocab_size", lm_head_weight.shape[0])
+        )
+        cache_key = (
+            id(logits_processor),
+            id(lm_head_weight),
+            tuple(lm_head_weight.shape),
+            lm_head_weight.dtype,
+            lm_head_weight.device,
+            org_vocab_size,
+            getattr(logits_processor, "logits_as_input", False),
+            getattr(logits_processor, "soft_cap", None),
+            float(getattr(logits_processor, "scale", 1.0)),
+            type(getattr(lm_head, "quant_method", None)).__name__,
+        )
+        if self._flashspec_lm_head_weight_cache_key == cache_key:
+            return self._flashspec_lm_head_weight_cache
+        if getattr(logits_processor, "logits_as_input", False):
+            return None
+        if getattr(logits_processor, "soft_cap", None) is not None:
+            return None
+        if float(getattr(logits_processor, "scale", 1.0)) != 1.0:
+            return None
+        quant_method = getattr(lm_head, "quant_method", None)
+        if type(quant_method).__name__ != "UnquantizedEmbeddingMethod":
+            return None
+        if org_vocab_size <= 0 or org_vocab_size > int(lm_head_weight.shape[0]):
+            return None
+        lm_head_weight = lm_head_weight[:org_vocab_size]
+        self._flashspec_lm_head_weight_cache_key = cache_key
+        self._flashspec_lm_head_weight_cache = lm_head_weight
+        return lm_head_weight
+
+    def _reserve_flashspec_draft_seed_offsets(
+        self,
+        increments: list[int],
+        *,
+        device: torch.device,
+    ) -> list[tuple[int, int]]:
+        if os.environ.get("FLASHSPEC_VLLM_DRAFT_RNG_CACHE", "0") != "1":
+            return _reserve_flashspec_seed_offsets(increments, device=device)
+
+        generator = lazy_import_flashinfer().utils.get_default_generators(device)
+        if (
+            self._flashspec_draft_rng_device != device
+            or self._flashspec_draft_rng_generator is not generator
+            or self._flashspec_draft_rng_state_i64 is None
+        ):
+            state_i64 = generator.get_state().view(torch.int64)
+            self._flashspec_draft_rng_state_i64 = state_i64.clone()
+            self._flashspec_draft_rng_device = device
+            self._flashspec_draft_rng_generator = generator
+
+        state_i64 = self._flashspec_draft_rng_state_i64
+        seed = int(state_i64[0].item())
+        offset = int(state_i64[1].item())
+        reserved: list[tuple[int, int]] = []
+        for increment in increments:
+            offset += _round_philox_increment(increment)
+            reserved.append((seed, offset))
+        state_i64[1] = offset
+        generator.set_state(state_i64.view(torch.uint8))
+        return reserved
+
+    def _flashspec_scalar_temperature(
+        self,
+        sampling_metadata: SamplingMetadata,
+        num_rows: int,
+    ) -> float:
+        temperature = sampling_metadata.temperature
+        if temperature is None:
+            return 1.0
+        if temperature.numel() == 1:
+            value = float(temperature.reshape(1)[0].item())
+        else:
+            values = temperature[:num_rows].to(dtype=torch.float32)
+            value = float(values[0].item())
+            if not bool(torch.allclose(values, values.new_full(values.shape, value))):
+                raise RuntimeError(
+                    "FlashSpec draft-model sampling currently requires one "
+                    "shared temperature across sampled draft rows."
+                )
+        return max(value, _SAMPLING_EPS)
+
+    def _ensure_flashspec_proposal_buffers(
+        self,
+        *,
+        batch_size: int,
+        hidden_size: int,
+        hidden_dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gamma = int(self.num_speculative_tokens)
+        capacity = max(int(self.max_batch_size), int(batch_size))
+        key = (capacity, gamma, hidden_size, hidden_dtype, device)
+        if self._flashspec_proposal_buffer_key != key:
+            self._flashspec_proposal_token_ids = torch.empty(
+                (capacity, gamma), dtype=torch.int32, device=device
+            )
+            self._flashspec_proposal_selected_logits = torch.empty(
+                (capacity, gamma), dtype=torch.float32, device=device
+            )
+            self._flashspec_proposal_row_lse = torch.empty(
+                (capacity, gamma), dtype=torch.float32, device=device
+            )
+            self._flashspec_proposal_buffer_key = key
+        assert self._flashspec_proposal_token_ids is not None
+        assert self._flashspec_proposal_selected_logits is not None
+        assert self._flashspec_proposal_row_lse is not None
+        return (
+            self._flashspec_proposal_token_ids,
+            self._flashspec_proposal_selected_logits,
+            self._flashspec_proposal_row_lse,
+        )
+
+    def _flashspec_sample_draft_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        *,
+        lm_head_weight: torch.Tensor | None = None,
+        temperature: float | None = None,
+        config=None,
+        num_sms: int | None = None,
+        seed: int | None = None,
+        offset: int | None = None,
+        output_token_ids: torch.Tensor | None = None,
+        output_selected_logits: torch.Tensor | None = None,
+        output_row_lse: torch.Tensor | None = None,
+        output_stride: int = 1,
+        output_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lm_head_weight = lm_head_weight if lm_head_weight is not None else self._flashspec_lm_head_weight()
+        if lm_head_weight is None:
+            raise RuntimeError(
+                "FlashSpec draft-model sampling requires an unquantized lm_head "
+                "with a standard logits processor."
+            )
+        if not hidden_states.is_cuda or hidden_states.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise RuntimeError(
+                "FlashSpec draft-model sampling requires CUDA fp16/bf16 hidden states."
+            )
+        if lm_head_weight.device != hidden_states.device:
+            raise RuntimeError("Draft lm_head and hidden states must share a device.")
+        if lm_head_weight.dtype != hidden_states.dtype:
+            raise RuntimeError("Draft lm_head dtype must match hidden states.")
+        if lm_head_weight.shape[1] != hidden_states.shape[1]:
+            raise RuntimeError("Draft hidden size mismatch between hidden and lm_head.")
+
+        from flashspec._internal.draft_hidden.ops import (
+            draft_sample_metadata_from_hidden_flashsampling_style_into,
+            draft_sample_metadata_from_hidden_flashsampling_style_prechecked_into,
+            make_flashsampling_style_workspace,
+            _select_best_config,
+        )
+
+        num_rows = int(hidden_states.shape[0])
+        vocab_size = int(lm_head_weight.shape[0])
+        config = config or _select_best_config(num_rows, vocab_size)
+        workspace_key = (
+            num_rows,
+            vocab_size,
+            hidden_states.device,
+            hidden_states.dtype,
+            config,
+        )
+        if (
+            self._flashspec_draft_workspace is None
+            or self._flashspec_draft_workspace_key != workspace_key
+        ):
+            self._flashspec_draft_workspace = make_flashsampling_style_workspace(
+                num_rows=num_rows,
+                vocab_size=vocab_size,
+                device=hidden_states.device,
+                config=config,
+                include_log_selected_prob=False,
+            )
+            self._flashspec_draft_workspace_key = workspace_key
+
+        temperature = (
+            float(temperature)
+            if temperature is not None
+            else self._flashspec_scalar_temperature(sampling_metadata, num_rows=num_rows)
+        )
+        if not self._flashspec_draft_logged:
+            logger.info(
+                "FlashSpec draft-model sampling fast path active: sampling "
+                "draft tokens from hidden states without materializing logits/probs."
+            )
+            self._flashspec_draft_logged = True
+
+        can_use_prechecked = (
+            seed is not None
+            and offset is not None
+            and output_token_ids is not None
+            and output_selected_logits is not None
+            and output_row_lse is not None
+            and os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_DEBUG_COMPARE", "0") != "1"
+        )
+        if can_use_prechecked:
+            hidden_states = hidden_states.contiguous()
+            flat_output_token_ids = (
+                output_token_ids
+                if output_token_ids.ndim == 1
+                else output_token_ids.reshape(-1)
+            )
+            flat_output_selected_logits = (
+                output_selected_logits
+                if output_selected_logits.ndim == 1
+                else output_selected_logits.reshape(-1)
+            )
+            flat_output_row_lse = (
+                output_row_lse
+                if output_row_lse.ndim == 1
+                else output_row_lse.reshape(-1)
+            )
+            record_stage(
+                "flashspec.draft.sample_metadata_from_hidden",
+                lambda: draft_sample_metadata_from_hidden_flashsampling_style_prechecked_into(
+                    hidden_states=hidden_states,
+                    lm_head_weight=lm_head_weight,
+                    workspace=self._flashspec_draft_workspace,
+                    temperature=temperature,
+                    seed=int(seed),
+                    offset=int(offset),
+                    config=config,
+                    num_sms=(
+                        int(num_sms)
+                        if num_sms is not None
+                        else torch.cuda.get_device_properties(
+                            hidden_states.device
+                        ).multi_processor_count
+                    ),
+                    strided_sampled_token_ids=flat_output_token_ids,
+                    strided_selected_logits=flat_output_selected_logits,
+                    strided_row_lse=flat_output_row_lse,
+                    strided_output_stride=output_stride,
+                    strided_output_offset=output_offset,
+                ),
+                rows=num_rows,
+                vocab_size=vocab_size,
+                hidden_size=int(hidden_states.shape[-1]),
+                prechecked=True,
+            )
+            return (
+                self._flashspec_draft_workspace.sampled_token_ids[:num_rows],
+                self._flashspec_draft_workspace.selected_logits[:num_rows],
+                self._flashspec_draft_workspace.row_lse[:num_rows],
+            )
+
+        record_stage(
+            "flashspec.draft.sample_metadata_from_hidden",
+            lambda: draft_sample_metadata_from_hidden_flashsampling_style_into(
+                hidden_states=hidden_states.contiguous(),
+                lm_head_weight=lm_head_weight,
+                workspace=self._flashspec_draft_workspace,
+                temperature=temperature,
+                deterministic=True,
+                generator=None,
+                seed=seed,
+                offset=offset,
+                return_debug_tensors=False,
+                strided_sampled_token_ids=output_token_ids,
+                strided_selected_logits=output_selected_logits,
+                strided_row_lse=output_row_lse,
+                strided_output_stride=output_stride,
+                strided_output_offset=output_offset,
+            ),
+            rows=num_rows,
+            vocab_size=vocab_size,
+            hidden_size=int(hidden_states.shape[-1]),
+            prechecked=False,
+        )
+        if os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_DEBUG_COMPARE", "0") == "1":
+            with torch.no_grad():
+                ref_logits = self.model.compute_logits(hidden_states).to(torch.float32)
+                ref_scaled = ref_logits / temperature
+                token_ids = self._flashspec_draft_workspace.sampled_token_ids[
+                    :num_rows
+                ].to(dtype=torch.long)
+                rows = torch.arange(num_rows, device=hidden_states.device)
+                ref_selected = ref_logits[rows, token_ids]
+                ref_row_lse = torch.logsumexp(ref_scaled, dim=-1)
+                selected_diff = (
+                    self._flashspec_draft_workspace.selected_logits[:num_rows]
+                    - ref_selected
+                ).abs()
+                lse_diff = (
+                    self._flashspec_draft_workspace.row_lse[:num_rows]
+                    - ref_row_lse
+                ).abs()
+                logger.info(
+                    "FlashSpec draft debug: max_selected_logit_diff=%.6g "
+                    "max_row_lse_diff=%.6g sampled_token_min=%d sampled_token_max=%d",
+                    float(selected_diff.max().item()),
+                    float(lse_diff.max().item()),
+                    int(token_ids.min().item()),
+                    int(token_ids.max().item()),
+                )
+        return (
+            self._flashspec_draft_workspace.sampled_token_ids[:num_rows],
+            self._flashspec_draft_workspace.selected_logits[:num_rows],
+            self._flashspec_draft_workspace.row_lse[:num_rows],
+        )
+
+    def _sample_draft_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if not self._use_draft_model_sampling(sampling_metadata):
+            return self._greedy_sample(hidden_states), None, None, None
+
+        sample_impl = self._draft_model_sampling_impl()
+        if sample_impl == "flashspec_with_probs":
+            token_ids, _, _ = self._flashspec_sample_draft_token_ids(
+                hidden_states, sampling_metadata
+            )
+            logits = record_stage(
+                "stock.draft.compute_logits",
+                lambda: self.model.compute_logits(hidden_states).to(torch.float32),
+                rows=int(hidden_states.shape[0]),
+                hidden_size=int(hidden_states.shape[-1]),
+            )
+            temperature = sampling_metadata.temperature
+            if temperature is not None:
+                if temperature.numel() == 1:
+                    temp = temperature.reshape(1).expand(logits.shape[0])
+                else:
+                    temp = temperature[: logits.shape[0]]
+                temp = temp.to(device=logits.device, dtype=torch.float32).clamp_min(
+                    _SAMPLING_EPS
+                )
+                logits = logits / temp.view(-1, 1)
+            draft_probs = record_stage(
+                "stock.draft.softmax",
+                lambda: torch.softmax(logits, dim=-1).contiguous(),
+                rows=int(logits.shape[0]),
+                vocab_size=int(logits.shape[-1]),
+            )
+            return token_ids, draft_probs, None, None
+
+        if self._use_flashspec_draft_model_sampling(sampling_metadata):
+            token_ids, selected_logits, row_lse = self._flashspec_sample_draft_token_ids(
+                hidden_states, sampling_metadata
+            )
+            return token_ids, None, selected_logits, row_lse
+
+        logits = record_stage(
+            "stock.draft.compute_logits",
+            lambda: self.model.compute_logits(hidden_states).to(torch.float32),
+            rows=int(hidden_states.shape[0]),
+            hidden_size=int(hidden_states.shape[-1]),
+        )
+        temperature = sampling_metadata.temperature
+        if temperature is not None:
+            if temperature.numel() == 1:
+                temp = temperature.reshape(1).expand(logits.shape[0])
+            else:
+                temp = temperature[: logits.shape[0]]
+            temp = temp.to(device=logits.device, dtype=torch.float32).clamp_min(
+                _SAMPLING_EPS
+            )
+            logits = logits / temp.view(-1, 1)
+
+        draft_probs = record_stage(
+            "stock.draft.softmax",
+            lambda: torch.softmax(logits, dim=-1).contiguous(),
+            rows=int(logits.shape[0]),
+            vocab_size=int(logits.shape[-1]),
+        )
+        draft_token_ids = record_stage(
+            "stock.draft.multinomial",
+            lambda: torch.multinomial(draft_probs, num_samples=1).squeeze(-1),
+            rows=int(draft_probs.shape[0]),
+            vocab_size=int(draft_probs.shape[-1]),
+        )
+        return draft_token_ids, draft_probs, None, None
+
     def propose(
         self,
         # [num_tokens]
@@ -409,6 +879,10 @@ class SpecDecodeBaseProposer:
         | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
+        self.last_draft_probs = None
+        self.last_draft_hidden_states = None
+        self.last_draft_selected_logits = None
+        self.last_draft_row_lse = None
 
         if self.method in ("eagle3", "dflash"):
             assert isinstance(
@@ -469,7 +943,16 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            draft_token_ids, draft_probs, selected_logits, row_lse = (
+                self._sample_draft_token_ids(
+                    sample_hidden_states, sampling_metadata
+                )
+            )
+            self.last_draft_probs = draft_probs
+            if selected_logits is not None and row_lse is not None:
+                self.last_draft_hidden_states = sample_hidden_states.unsqueeze(1)
+                self.last_draft_selected_logits = selected_logits.unsqueeze(1)
+                self.last_draft_row_lse = row_lse.unsqueeze(1)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -484,7 +967,77 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
-        draft_token_ids = self._greedy_sample(sample_hidden_states)
+        use_flashspec_metadata = self._use_flashspec_draft_model_sampling(
+            sampling_metadata
+        )
+        if use_flashspec_metadata:
+            (
+                flashspec_token_buffer,
+                flashspec_selected_logits_buffer,
+                flashspec_row_lse_buffer,
+            ) = self._ensure_flashspec_proposal_buffers(
+                batch_size=batch_size,
+                hidden_size=int(sample_hidden_states.shape[-1]),
+                hidden_dtype=sample_hidden_states.dtype,
+                device=sample_hidden_states.device,
+            )
+            gamma = int(self.num_speculative_tokens)
+            draft_lm_head_weight = self._flashspec_lm_head_weight()
+            if draft_lm_head_weight is None:
+                raise RuntimeError(
+                    "FlashSpec draft-model sampling requires an unquantized lm_head "
+                    "with a standard logits processor."
+                )
+            from flashspec._internal.draft_hidden.ops import _select_best_config
+
+            draft_temperature = self._flashspec_scalar_temperature(
+                sampling_metadata, num_rows=batch_size
+            )
+            draft_config = _select_best_config(
+                batch_size, int(draft_lm_head_weight.shape[0])
+            )
+            draft_num_sms = torch.cuda.get_device_properties(
+                sample_hidden_states.device
+            ).multi_processor_count
+            seed_offsets = record_stage(
+                "flashspec.proposer.reserve_draft_rng",
+                lambda: self._reserve_flashspec_draft_seed_offsets(
+                    [batch_size * int(draft_lm_head_weight.shape[0])] * gamma,
+                    device=sample_hidden_states.device,
+                ),
+                gamma=gamma,
+                rows=int(batch_size),
+                vocab_size=int(draft_lm_head_weight.shape[0]),
+            )
+            seed0, offset0 = seed_offsets[0]
+            draft_token_ids, selected_logits, row_lse = self._flashspec_sample_draft_token_ids(
+                sample_hidden_states,
+                sampling_metadata,
+                lm_head_weight=draft_lm_head_weight,
+                temperature=draft_temperature,
+                config=draft_config,
+                num_sms=draft_num_sms,
+                seed=seed0,
+                offset=offset0,
+                output_token_ids=flashspec_token_buffer,
+                output_selected_logits=flashspec_selected_logits_buffer,
+                output_row_lse=flashspec_row_lse_buffer,
+                output_stride=gamma,
+                output_offset=0,
+            )
+            draft_probs = None
+        else:
+            flashspec_token_buffer = None
+            flashspec_selected_logits_buffer = None
+            flashspec_row_lse_buffer = None
+            seed_offsets = None
+            draft_lm_head_weight = None
+            draft_temperature = None
+            draft_config = None
+            draft_num_sms = None
+            draft_token_ids, draft_probs, selected_logits, row_lse = (
+                self._sample_draft_token_ids(sample_hidden_states, sampling_metadata)
+            )
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -497,7 +1050,18 @@ class SpecDecodeBaseProposer:
                     )
 
         # Generate the remaining draft tokens.
-        draft_token_ids_list = [draft_token_ids]
+        flashspec_metadata = selected_logits is not None and row_lse is not None
+        if flashspec_metadata:
+            assert flashspec_token_buffer is not None
+            assert flashspec_selected_logits_buffer is not None
+            assert flashspec_row_lse_buffer is not None
+            draft_token_ids_list = None
+            draft_probs_list = None
+            draft_hidden_states_list = [sample_hidden_states]
+        else:
+            draft_token_ids_list = [draft_token_ids]
+            draft_probs_list = [draft_probs] if draft_probs is not None else None
+            draft_hidden_states_list = None
 
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
@@ -526,7 +1090,7 @@ class SpecDecodeBaseProposer:
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            input_ids = draft_token_ids.int()
 
             if not self.constant_draft_positions:
                 positions = self._update_positions_dependent_metadata(
@@ -584,11 +1148,84 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
-            draft_token_ids_list.append(draft_token_ids)
+            step_hidden_states = last_hidden_states[:batch_size]
+            if flashspec_metadata:
+                assert flashspec_token_buffer is not None
+                assert flashspec_selected_logits_buffer is not None
+                assert flashspec_row_lse_buffer is not None
+                assert seed_offsets is not None
+                step_seed, step_offset = seed_offsets[token_index + 1]
+                draft_token_ids, selected_logits, row_lse = self._flashspec_sample_draft_token_ids(
+                    step_hidden_states,
+                    sampling_metadata,
+                    lm_head_weight=draft_lm_head_weight,
+                    temperature=draft_temperature,
+                    config=draft_config,
+                    num_sms=draft_num_sms,
+                    seed=step_seed,
+                    offset=step_offset,
+                    output_token_ids=flashspec_token_buffer,
+                    output_selected_logits=flashspec_selected_logits_buffer,
+                    output_row_lse=flashspec_row_lse_buffer,
+                    output_stride=int(self.num_speculative_tokens),
+                    output_offset=token_index + 1,
+                )
+                draft_probs = None
+            else:
+                draft_token_ids, draft_probs, selected_logits, row_lse = (
+                    self._sample_draft_token_ids(
+                        step_hidden_states, sampling_metadata
+                    )
+                )
+            if flashspec_metadata:
+                assert draft_hidden_states_list is not None
+                draft_hidden_states_list.append(step_hidden_states)
+            else:
+                assert draft_token_ids_list is not None
+                draft_token_ids_list.append(draft_token_ids)
+                if draft_probs_list is not None:
+                    assert draft_probs is not None
+                    draft_probs_list.append(draft_probs)
 
         # [batch_size, num_speculative_tokens]
-        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if flashspec_metadata:
+            assert flashspec_token_buffer is not None
+            assert flashspec_selected_logits_buffer is not None
+            assert flashspec_row_lse_buffer is not None
+            assert draft_hidden_states_list is not None
+            gamma = int(self.num_speculative_tokens)
+            draft_token_ids = flashspec_token_buffer[:batch_size, :gamma]
+            self.last_draft_hidden_states = record_stage(
+                "flashspec.proposer.draft_hidden_stack",
+                lambda: torch.stack(draft_hidden_states_list, dim=1).contiguous(),
+                gamma=gamma,
+                rows=int(batch_size),
+            )
+            self.last_draft_selected_logits = flashspec_selected_logits_buffer[
+                :batch_size, :gamma
+            ]
+            self.last_draft_row_lse = flashspec_row_lse_buffer[:batch_size, :gamma]
+            return draft_token_ids
+
+        assert draft_token_ids_list is not None
+        draft_token_ids = record_stage(
+            "proposer.draft_token_stack",
+            lambda: torch.stack(draft_token_ids_list, dim=1),
+            gamma=int(self.num_speculative_tokens),
+            rows=int(batch_size),
+            impl="stock",
+        )
+        if draft_probs_list is not None:
+            # Match draft_token_ids.reshape(-1): request-major, then draft position.
+            self.last_draft_probs = record_stage(
+                "stock.proposer.draft_probs_stack",
+                lambda: torch.stack(draft_probs_list, dim=1).reshape(
+                    -1, draft_probs_list[0].shape[-1]
+                ),
+                gamma=int(self.num_speculative_tokens),
+                rows=int(batch_size),
+                vocab_size=int(draft_probs_list[0].shape[-1]),
+            )
         return draft_token_ids
 
     def _update_positions_dependent_metadata(

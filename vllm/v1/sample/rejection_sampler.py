@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from flashspec._internal.vllm_profile import record_stage
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -32,6 +34,21 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _has_active_flashspec_unsupported_logits_processors(
+    sampling_metadata: SamplingMetadata,
+) -> bool:
+    if sampling_metadata.logitsprocs.argmax_invariant:
+        return True
+    for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+        if (
+            isinstance(processor, MinTokensLogitsProcessor)
+            and not processor.min_toks
+        ):
+            continue
+        return True
+    return False
 
 
 class RejectionSampler(nn.Module):
@@ -83,6 +100,89 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self._flashspec_ngram_greedy = None
+        self._flashspec_ngram_stochastic = None
+        self._flashspec_ngram_greedy_logged = False
+        self._flashspec_ngram_stochastic_logged = False
+        if (
+            os.environ.get("FLASHSPEC_VLLM_USE_DELTA_DRAFT") == "1"
+            or os.environ.get("FLASHSPEC_VLLM_USE_DELTA_DRAFT_GREEDY") == "1"
+            or os.environ.get("FLASHSPEC_VLLM_USE_NGRAM") == "1"
+            or os.environ.get("FLASHSPEC_VLLM_USE_NGRAM_GREEDY") == "1"
+        ):
+            try:
+                from flashspec.vllm import (
+                    ngram_greedy_verify_resample,
+                    ngram_stochastic_verify_resample,
+                )
+
+                self._flashspec_ngram_greedy = ngram_greedy_verify_resample
+                self._flashspec_ngram_stochastic = ngram_stochastic_verify_resample
+                logger.info("Using FlashSpec delta-draft rejection sampler.")
+            except Exception:
+                logger.exception(
+                    "Failed to import FlashSpec delta-draft rejection sampler."
+                )
+
+    def _can_use_flashspec_ngram_greedy(
+        self,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor | None,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        if self._flashspec_ngram_greedy is None:
+            return False
+        if draft_probs is not None or self.synthetic_mode:
+            return False
+        if not sampling_metadata.all_greedy:
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if not sampling_metadata.no_penalties:
+            return False
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return False
+        if sampling_metadata.bad_words_token_ids:
+            return False
+        if _has_active_flashspec_unsupported_logits_processors(sampling_metadata):
+            return False
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        return logits.is_cuda and logits.is_contiguous() and metadata.max_spec_len >= 0
+
+    def _can_use_flashspec_ngram_stochastic(
+        self,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor | None,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        if self._flashspec_ngram_stochastic is None:
+            return False
+        if draft_probs is not None or self.synthetic_mode:
+            return False
+        if not sampling_metadata.all_random:
+            return False
+        if sampling_metadata.temperature is None:
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if not sampling_metadata.no_penalties:
+            return False
+        if sampling_metadata.top_p is not None or sampling_metadata.top_k is not None:
+            return False
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return False
+        if sampling_metadata.bad_words_token_ids:
+            return False
+        if _has_active_flashspec_unsupported_logits_processors(sampling_metadata):
+            return False
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        return logits.is_cuda and logits.is_contiguous() and metadata.max_spec_len >= 0
 
     def forward(
         self,
@@ -116,6 +216,48 @@ class RejectionSampler(nn.Module):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        assert logits is not None
+
+        if self._can_use_flashspec_ngram_greedy(
+            metadata, draft_probs, logits, sampling_metadata
+        ):
+            if not self._flashspec_ngram_greedy_logged:
+                logger.info("FlashSpec delta-draft greedy fast path active.")
+                self._flashspec_ngram_greedy_logged = True
+            output_token_ids = self._flashspec_ngram_greedy(
+                logits=logits,
+                draft_token_ids=metadata.draft_token_ids,
+                cu_num_draft_tokens=metadata.cu_num_draft_tokens,
+                target_logits_indices=metadata.target_logits_indices,
+                bonus_logits_indices=metadata.bonus_logits_indices,
+                max_spec_len=metadata.max_spec_len,
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
+
+        if self._can_use_flashspec_ngram_stochastic(
+            metadata, draft_probs, logits, sampling_metadata
+        ):
+            if not self._flashspec_ngram_stochastic_logged:
+                logger.info("FlashSpec delta-draft stochastic fast path active.")
+                self._flashspec_ngram_stochastic_logged = True
+            output_token_ids = self._flashspec_ngram_stochastic(
+                logits=logits,
+                draft_token_ids=metadata.draft_token_ids,
+                cu_num_draft_tokens=metadata.cu_num_draft_tokens,
+                target_logits_indices=metadata.target_logits_indices,
+                bonus_logits_indices=metadata.bonus_logits_indices,
+                max_spec_len=metadata.max_spec_len,
+                temperature=sampling_metadata.temperature,
+                generators=sampling_metadata.generators,
+                num_draft_tokens=metadata.num_draft_tokens,
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
 
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
@@ -124,58 +266,97 @@ class RejectionSampler(nn.Module):
         # creates a new tensor with separate storage from the original
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
-        assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
-        bonus_sampler_output = self.sampler(
-            logits=bonus_logits,
-            sampling_metadata=replace(
-                sampling_metadata,
-                max_num_logprobs=-1,
+        bonus_logits = record_stage(
+            "stock.tail.bonus_logits_gather",
+            lambda: logits[bonus_logits_indices],
+            batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+            gamma=int(metadata.max_spec_len),
+            vocab_size=int(logits.shape[-1]),
+        )
+        bonus_sampler_output = record_stage(
+            "stock.tail.bonus_sampler",
+            lambda: self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=replace(
+                    sampling_metadata,
+                    max_num_logprobs=-1,
+                ),
+                predict_bonus_token=True,
+                # Override the logprobs mode to return logits because they are
+                # needed later to compute the accepted token logprobs.
+                logprobs_mode_override="processed_logits"
+                if self.is_processed_logprobs_mode
+                else "raw_logits",
             ),
-            predict_bonus_token=True,
-            # Override the logprobs mode to return logits because they are
-            # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
+            batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+            gamma=int(metadata.max_spec_len),
+            vocab_size=int(logits.shape[-1]),
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
-        raw_target_logits = logits[target_logits_indices]
-        # Use float32 for the target_logits.
-        raw_target_logits = raw_target_logits.to(torch.float32)
+        raw_target_logits = record_stage(
+            "stock.tail.target_logits_gather_to_fp32",
+            lambda: logits[target_logits_indices].to(torch.float32),
+            batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+            gamma=int(metadata.max_spec_len),
+            vocab_size=int(logits.shape[-1]),
+        )
         target_logits = raw_target_logits
         if not self.is_processed_logprobs_mode:
             # Clone raw_target_logits before applying processors to preserve
             # the original raw logits for logprobs computation, since
             # apply_logits_processors modifies the tensor in-place.
-            target_logits = target_logits.clone()
-        target_logits = self.apply_logits_processors(
-            target_logits, sampling_metadata, metadata
+            target_logits = record_stage(
+                "stock.tail.target_logits_clone",
+                lambda: target_logits.clone(),
+                batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+                gamma=int(metadata.max_spec_len),
+                vocab_size=int(logits.shape[-1]),
+            )
+        target_logits = record_stage(
+            "stock.tail.apply_logits_processors",
+            lambda: self.apply_logits_processors(
+                target_logits, sampling_metadata, metadata
+            ),
+            batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+            gamma=int(metadata.max_spec_len),
+            vocab_size=int(logits.shape[-1]),
         )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
-        target_logits = apply_sampling_constraints(
-            target_logits,
-            metadata.cu_num_draft_tokens,
-            sampling_metadata,
+        target_logits = record_stage(
+            "stock.tail.apply_sampling_constraints",
+            lambda: apply_sampling_constraints(
+                target_logits,
+                metadata.cu_num_draft_tokens,
+                sampling_metadata,
+            ),
+            batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+            gamma=int(metadata.max_spec_len),
+            vocab_size=int(logits.shape[-1]),
         )
 
-        output_token_ids = rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_logits,
-            bonus_token_ids,
-            sampling_metadata,
-            synthetic_mode=self.synthetic_mode,
-            synthetic_conditional_rates=self.synthetic_conditional_rates,
+        output_token_ids = record_stage(
+            "stock.tail.rejection_sample",
+            lambda: rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+                synthetic_mode=self.synthetic_mode,
+                synthetic_conditional_rates=self.synthetic_conditional_rates,
+            ),
+            batch_size=int(metadata.cu_num_draft_tokens.shape[0]),
+            gamma=int(metadata.max_spec_len),
+            vocab_size=int(logits.shape[-1]),
         )
 
         logprobs_tensors = None

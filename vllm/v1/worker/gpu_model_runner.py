@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -19,6 +20,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
+from flashspec._internal.vllm_profile import record_stage
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
@@ -167,7 +169,10 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import (
+    RejectionSampler,
+    _has_active_flashspec_unsupported_logits_processors,
+)
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -385,7 +390,7 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | SamplerOutput
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -588,6 +593,13 @@ class GPUModelRunner(
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
+        self._flashspec_ngram_hidden_sampler = None
+        self._flashspec_ngram_hidden_logged = False
+        self._flashspec_draft_model_general_sampler = None
+        self._flashspec_draft_model_general_logged = False
+        self._flashspec_lm_head_weight_cache: dict[
+            int, tuple[tuple[object, ...], torch.Tensor | None]
+        ] = {}
 
         self.num_spec_tokens = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
@@ -801,6 +813,11 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._draft_probs: torch.Tensor | None = None
+        self._draft_hidden_states: torch.Tensor | None = None
+        self._draft_selected_logits: torch.Tensor | None = None
+        self._draft_row_lse: torch.Tensor | None = None
+        self._draft_probs_logged = False
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -3395,6 +3412,410 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _flashspec_standard_lm_head_weight(
+        self,
+        model: torch.nn.Module,
+    ) -> torch.Tensor | None:
+        unwrap = getattr(model, "unwrap", None)
+        if callable(unwrap):
+            model = unwrap()
+        if (
+            getattr(model, "lm_head", None) is None
+            and getattr(model, "logits_processor", None) is None
+            and hasattr(model, "language_model")
+        ):
+            model = model.language_model
+
+        def log_unavailable(reason: str) -> None:
+            if os.environ.get("FLASHSPEC_VLLM_DEBUG_HIDDEN_SKIP") != "1":
+                return
+            debug_logits_processor = getattr(model, "logits_processor", None)
+            debug_lm_head = getattr(model, "lm_head", None)
+            debug_weight = getattr(debug_lm_head, "weight", None)
+            logger.info(
+                "FlashSpec lm_head unavailable: %s "
+                "(model=%s, logits_processor=%s, lm_head=%s, weight=%s, "
+                "quant_method=%s, scale=%s, soft_cap=%s, logits_as_input=%s)",
+                reason,
+                type(model).__name__,
+                type(debug_logits_processor).__name__
+                if debug_logits_processor is not None
+                else None,
+                type(debug_lm_head).__name__ if debug_lm_head is not None else None,
+                tuple(debug_weight.shape)
+                if isinstance(debug_weight, torch.Tensor)
+                else type(debug_weight).__name__,
+                type(getattr(debug_lm_head, "quant_method", None)).__name__
+                if debug_lm_head is not None
+                else None,
+                getattr(debug_logits_processor, "scale", None)
+                if debug_logits_processor is not None
+                else None,
+                getattr(debug_logits_processor, "soft_cap", None)
+                if debug_logits_processor is not None
+                else None,
+                getattr(debug_logits_processor, "logits_as_input", None)
+                if debug_logits_processor is not None
+                else None,
+            )
+
+        logits_processor = getattr(model, "logits_processor", None)
+        lm_head = getattr(model, "lm_head", None)
+        lm_head_weight = getattr(lm_head, "weight", None)
+        if logits_processor is None or lm_head_weight is None:
+            log_unavailable("missing logits_processor or lm_head.weight")
+            return None
+        if not isinstance(lm_head_weight, torch.Tensor):
+            log_unavailable("lm_head.weight is not a tensor")
+            return None
+        org_vocab_size = int(
+            getattr(logits_processor, "org_vocab_size", lm_head_weight.shape[0])
+        )
+        cache_key = (
+            id(logits_processor),
+            id(lm_head_weight),
+            tuple(lm_head_weight.shape),
+            lm_head_weight.dtype,
+            lm_head_weight.device,
+            org_vocab_size,
+            getattr(logits_processor, "logits_as_input", False),
+            getattr(logits_processor, "soft_cap", None),
+            float(getattr(logits_processor, "scale", 1.0)),
+            type(getattr(lm_head, "quant_method", None)).__name__,
+        )
+        cached = self._flashspec_lm_head_weight_cache.get(id(model))
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        if getattr(logits_processor, "logits_as_input", False):
+            log_unavailable("logits_processor.logits_as_input is enabled")
+            return None
+        if getattr(logits_processor, "soft_cap", None) is not None:
+            log_unavailable("logits_processor.soft_cap is enabled")
+            return None
+        if float(getattr(logits_processor, "scale", 1.0)) != 1.0:
+            log_unavailable("logits_processor.scale is not 1.0")
+            return None
+        quant_method = getattr(lm_head, "quant_method", None)
+        quant_method_name = type(quant_method).__name__
+        # ParallelLMHead and VocabParallelEmbedding both expose raw [V, H]
+        # weights in the unquantized case. Some tied-embedding model variants
+        # expose no quant_method object on the shared head, so accept None here
+        # as long as the weight itself is dense and TP is 1.
+        if quant_method is not None and quant_method_name != "UnquantizedEmbeddingMethod":
+            log_unavailable(f"unsupported quant_method={quant_method_name}")
+            return None
+        if org_vocab_size <= 0 or org_vocab_size > int(lm_head_weight.shape[0]):
+            log_unavailable(
+                f"invalid org_vocab_size={org_vocab_size} for weight rows="
+                f"{int(lm_head_weight.shape[0])}"
+            )
+            return None
+        lm_head_weight = lm_head_weight[:org_vocab_size]
+        self._flashspec_lm_head_weight_cache[id(model)] = (cache_key, lm_head_weight)
+        return lm_head_weight
+
+    def _can_flashspec_sample_from_hidden_common(
+        self,
+        hidden_states: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if spec_decode_metadata is None:
+            return False
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_random or sampling_metadata.temperature is None:
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if not sampling_metadata.no_penalties:
+            return False
+        if sampling_metadata.top_p is not None or sampling_metadata.top_k is not None:
+            return False
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return False
+        if sampling_metadata.bad_words_token_ids:
+            return False
+        if _has_active_flashspec_unsupported_logits_processors(sampling_metadata):
+            return False
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        if get_tp_group().world_size != 1:
+            return False
+        return bool(hidden_states.is_cuda)
+
+    def _flashspec_shared_temperature(self, num_reqs: int) -> float | None:
+        temperatures = self.input_batch.temperature_cpu[:num_reqs]
+        temperature = float(temperatures[0])
+        if temperature <= 0.0 or not np.allclose(temperatures, temperature):
+            return None
+        return temperature
+
+    def _try_flashspec_draft_model_sample_from_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> SamplerOutput | None:
+        if os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_FLASHSPEC", "0") != "1":
+            return None
+        if not self._can_flashspec_sample_from_hidden_common(
+            hidden_states, spec_decode_metadata
+        ):
+            return None
+        assert spec_decode_metadata is not None
+
+        draft_hidden_states = self._draft_hidden_states
+        draft_selected_logits = self._draft_selected_logits
+        draft_row_lse = self._draft_row_lse
+        if (
+            draft_hidden_states is None
+            or draft_selected_logits is None
+            or draft_row_lse is None
+        ):
+            return None
+
+        max_spec_len = spec_decode_metadata.max_spec_len
+        num_reqs = self.input_batch.num_reqs
+        if max_spec_len <= 0 or num_reqs <= 0:
+            return None
+        if any(n != max_spec_len for n in spec_decode_metadata.num_draft_tokens):
+            return None
+        if spec_decode_metadata.draft_token_ids.numel() != num_reqs * max_spec_len:
+            return None
+        if logits_indices.numel() != num_reqs * (max_spec_len + 1):
+            return None
+        temperature = self._flashspec_shared_temperature(num_reqs)
+        if temperature is None:
+            return None
+
+        target_lm_head_weight = self._flashspec_standard_lm_head_weight(self.model)
+        draft_lm_head_weight = None
+        draft_lm_head_getter = getattr(self.drafter, "_flashspec_lm_head_weight", None)
+        if callable(draft_lm_head_getter):
+            draft_lm_head_weight = draft_lm_head_getter()
+        if draft_lm_head_weight is None:
+            draft_model = getattr(self.drafter, "model", None)
+            if draft_model is None:
+                return None
+            draft_lm_head_weight = self._flashspec_standard_lm_head_weight(draft_model)
+        if target_lm_head_weight is None or draft_lm_head_weight is None:
+            return None
+        if target_lm_head_weight.shape[0] != draft_lm_head_weight.shape[0]:
+            return None
+
+        draft_token_ids = spec_decode_metadata.draft_token_ids
+        if isinstance(self._draft_token_ids, torch.Tensor):
+            candidate_draft_token_ids = self._draft_token_ids
+            if candidate_draft_token_ids.numel() == num_reqs * max_spec_len:
+                # Keep token ids aligned with the hidden rows / selected logits
+                # emitted by the drafter. For gamma > 1 the scheduled input
+                # buffer can be laid out differently from the proposer-owned
+                # request-major metadata.
+                draft_token_ids = candidate_draft_token_ids.reshape(-1)
+                if draft_token_ids.dtype != torch.int32:
+                    draft_token_ids = draft_token_ids.to(dtype=torch.int32)
+                if not draft_token_ids.is_contiguous():
+                    draft_token_ids = draft_token_ids.contiguous()
+
+        if os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_DEBUG_VERIFY", "0") != "0":
+            with torch.no_grad():
+                debug_hidden = draft_hidden_states.reshape(
+                    num_reqs * max_spec_len, draft_hidden_states.shape[-1]
+                )
+                debug_token_ids = draft_token_ids.reshape(-1).to(dtype=torch.long)
+                debug_rows = torch.arange(
+                    debug_token_ids.numel(), device=debug_token_ids.device
+                )
+                debug_logits = torch.matmul(
+                    debug_hidden.to(torch.float32),
+                    draft_lm_head_weight.to(torch.float32).t(),
+                )
+                debug_selected = debug_logits[debug_rows, debug_token_ids]
+                debug_lse = torch.logsumexp(debug_logits, dim=-1)
+                logger.info(
+                    "FlashSpec draft metadata precheck: selected_diff=%.6g "
+                    "row_lse_diff=%.6g",
+                    float(
+                        (
+                            debug_selected
+                            - draft_selected_logits.reshape(-1).to(torch.float32)
+                        )
+                        .abs()
+                        .max()
+                        .item()
+                    ),
+                    float(
+                        (
+                            debug_lse
+                            - draft_row_lse.reshape(-1).to(torch.float32)
+                        )
+                        .abs()
+                        .max()
+                        .item()
+                    ),
+                )
+
+        if self._flashspec_draft_model_general_sampler is None:
+            try:
+                from flashspec.vllm import (
+                    draft_model_stochastic_verify_resample_from_indexed_hidden,
+                )
+
+                self._flashspec_draft_model_general_sampler = (
+                    draft_model_stochastic_verify_resample_from_indexed_hidden
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to import FlashSpec draft-model general sampler."
+                )
+                return None
+
+        if not self._flashspec_draft_model_general_logged:
+            logger.info(
+                "FlashSpec draft-model stochastic general fast path active: "
+                "draft metadata + target_impl=%s verify/resample.",
+                os.environ.get("FLASHSPEC_VLLM_DRAFT_MODEL_TARGET_IMPL", "indexed"),
+            )
+            self._flashspec_draft_model_general_logged = True
+
+        output_token_ids = self._flashspec_draft_model_general_sampler(
+            hidden_states=hidden_states,
+            logits_indices=logits_indices,
+            target_logits_indices=spec_decode_metadata.target_logits_indices,
+            bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
+            target_lm_head_weight=target_lm_head_weight,
+            draft_lm_head_weight=draft_lm_head_weight,
+            draft_token_ids=draft_token_ids,
+            draft_hidden_states=draft_hidden_states,
+            draft_selected_logits=draft_selected_logits,
+            draft_row_lse=draft_row_lse,
+            cu_num_draft_tokens=spec_decode_metadata.cu_num_draft_tokens,
+            max_spec_len=max_spec_len,
+            temperature=temperature,
+            generators=self.input_batch.sampling_metadata.generators,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
+        )
+
+    def _try_flashspec_ngram_sample_from_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> SamplerOutput | None:
+        def delta_draft_hidden_enabled() -> bool:
+            return (
+                os.environ.get("FLASHSPEC_VLLM_DELTA_DRAFT_HIDDEN") == "1"
+                or os.environ.get("FLASHSPEC_VLLM_USE_DELTA_DRAFT_HIDDEN") == "1"
+                or os.environ.get("FLASHSPEC_VLLM_USE_NGRAM_HIDDEN") == "1"
+            )
+
+        def log_skip(reason: str) -> None:
+            if os.environ.get("FLASHSPEC_VLLM_DEBUG_HIDDEN_SKIP") != "1":
+                return
+            logger.info(
+                "FlashSpec hidden-state delta-draft sampler skipped: %s "
+                "(has_metadata=%s, has_draft_selected_logits=%s, "
+                "num_reqs=%s, logits_indices=%s)",
+                reason,
+                spec_decode_metadata is not None,
+                self._draft_selected_logits is not None,
+                getattr(self.input_batch, "num_reqs", None),
+                int(logits_indices.numel()) if logits_indices is not None else None,
+            )
+
+        if not delta_draft_hidden_enabled():
+            log_skip(
+                "FLASHSPEC_VLLM_USE_DELTA_DRAFT_HIDDEN "
+                "(or legacy FLASHSPEC_VLLM_USE_NGRAM_HIDDEN) is not enabled"
+            )
+            return None
+        if self._draft_selected_logits is not None:
+            log_skip("draft selected logits are present; use general draft-model hook")
+            return None
+        if not self._can_flashspec_sample_from_hidden_common(
+            hidden_states, spec_decode_metadata
+        ):
+            log_skip("common hidden sampler conditions failed")
+            return None
+        assert spec_decode_metadata is not None
+
+        sampling_metadata = self.input_batch.sampling_metadata
+
+        max_spec_len = spec_decode_metadata.max_spec_len
+        num_reqs = self.input_batch.num_reqs
+        if max_spec_len <= 0 or num_reqs <= 0:
+            log_skip(f"invalid max_spec_len={max_spec_len} or num_reqs={num_reqs}")
+            return None
+        if any(n != max_spec_len for n in spec_decode_metadata.num_draft_tokens):
+            log_skip(
+                "ragged draft lengths "
+                f"{list(spec_decode_metadata.num_draft_tokens)} != {max_spec_len}"
+            )
+            return None
+        if spec_decode_metadata.draft_token_ids.numel() != num_reqs * max_spec_len:
+            log_skip(
+                "draft_token_ids numel mismatch "
+                f"{int(spec_decode_metadata.draft_token_ids.numel())} != "
+                f"{num_reqs * max_spec_len}"
+            )
+            return None
+        if logits_indices.numel() != num_reqs * (max_spec_len + 1):
+            log_skip(
+                "logits_indices numel mismatch "
+                f"{int(logits_indices.numel())} != {num_reqs * (max_spec_len + 1)}"
+            )
+            return None
+
+        temperature = self._flashspec_shared_temperature(num_reqs)
+        if temperature is None:
+            log_skip("temperature is not a positive shared scalar")
+            return None
+
+        lm_head_weight = self._flashspec_standard_lm_head_weight(self.model)
+        if lm_head_weight is None:
+            log_skip("standard lm_head weight is unavailable")
+            return None
+
+        if self._flashspec_ngram_hidden_sampler is None:
+            try:
+                from flashspec.vllm import (
+                    delta_draft_stochastic_verify_resample_from_indexed_hidden,
+                )
+
+                self._flashspec_ngram_hidden_sampler = (
+                    delta_draft_stochastic_verify_resample_from_indexed_hidden
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to import FlashSpec hidden-state delta-draft sampler."
+                )
+                return None
+
+        if not self._flashspec_ngram_hidden_logged:
+            logger.info(
+                "FlashSpec hidden-state delta-draft stochastic fast path active."
+            )
+            self._flashspec_ngram_hidden_logged = True
+
+        output_token_ids = self._flashspec_ngram_hidden_sampler(
+            hidden_states=hidden_states,
+            logits_indices=logits_indices,
+            lm_head_weight=lm_head_weight,
+            draft_token_ids=spec_decode_metadata.draft_token_ids,
+            cu_num_draft_tokens=spec_decode_metadata.cu_num_draft_tokens,
+            max_spec_len=max_spec_len,
+            temperature=temperature,
+            generators=sampling_metadata.generators,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
+        )
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -3417,9 +3838,34 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        draft_probs = self._draft_probs
+        if self._draft_selected_logits is not None:
+            raise RuntimeError(
+                "FlashSpec draft-model sampling metadata reached the generic "
+                "vLLM rejection sampler. This would be incorrect because full "
+                "draft_probs were intentionally not materialized; ensure the "
+                "FlashSpec hidden-state general sampler is enabled and eligible."
+            )
+        if draft_probs is not None:
+            if not self._draft_probs_logged:
+                logger.info(
+                    "Draft-model sampling path active: passing draft_probs to "
+                    "the general rejection sampler."
+                )
+                self._draft_probs_logged = True
+            expected_num_draft_tokens = int(spec_decode_metadata.draft_token_ids.numel())
+            if draft_probs.shape[0] > expected_num_draft_tokens:
+                draft_probs = draft_probs[:expected_num_draft_tokens]
+            if draft_probs.shape[0] != expected_num_draft_tokens:
+                raise RuntimeError(
+                    "Draft model sampling produced draft_probs with incompatible "
+                    f"shape {tuple(draft_probs.shape)} for "
+                    f"{expected_num_draft_tokens} draft tokens."
+                )
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            draft_probs,
             logits,
             sampling_metadata,
         )
@@ -4150,8 +4596,37 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._try_flashspec_draft_model_sample_from_hidden(
+                    hidden_states,
+                    logits_indices,
+                    spec_decode_metadata,
+                )
+                if logits is None:
+                    logits = self._try_flashspec_ngram_sample_from_hidden(
+                        hidden_states,
+                        logits_indices,
+                        spec_decode_metadata,
+                    )
+                if logits is None:
+                    sample_hidden_states = record_stage(
+                        "stock.target.hidden_gather",
+                        lambda: hidden_states[logits_indices],
+                        batch_size=self.input_batch.num_reqs,
+                        rows=int(logits_indices.numel()),
+                        hidden_size=int(hidden_states.shape[-1]),
+                    )
+                    logits = record_stage(
+                        "stock.target.compute_logits",
+                        lambda: self.model.compute_logits(sample_hidden_states),
+                        batch_size=self.input_batch.num_reqs,
+                        rows=int(sample_hidden_states.shape[0]),
+                        hidden_size=int(sample_hidden_states.shape[-1]),
+                    )
+                else:
+                    # FlashSpec hidden samplers consume the target hidden rows.
+                    # Avoid re-materializing sampled hidden rows after the
+                    # sampler has already consumed them.
+                    sample_hidden_states = hidden_states
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4241,14 +4716,17 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
+        if isinstance(logits, SamplerOutput):
+            sampler_output = logits
+        else:
+            # Apply structured output bitmasks if present.
+            if grammar_output is not None:
+                apply_grammar_bitmask(
+                    scheduler_output, grammar_output, self.input_batch, logits
+                )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4264,6 +4742,10 @@ class GPUModelRunner(
                 )
 
         self._draft_token_ids = None
+        self._draft_probs = None
+        self._draft_hidden_states = None
+        self._draft_selected_logits = None
+        self._draft_row_lse = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -4372,7 +4854,7 @@ class GPUModelRunner(
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
-                logits,
+                None if isinstance(logits, SamplerOutput) else logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
@@ -4835,6 +5317,14 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            self._draft_probs = getattr(self.drafter, "last_draft_probs", None)
+            self._draft_hidden_states = getattr(
+                self.drafter, "last_draft_hidden_states", None
+            )
+            self._draft_selected_logits = getattr(
+                self.drafter, "last_draft_selected_logits", None
+            )
+            self._draft_row_lse = getattr(self.drafter, "last_draft_row_lse", None)
 
         return draft_token_ids
 
